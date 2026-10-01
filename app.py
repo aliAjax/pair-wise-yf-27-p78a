@@ -57,6 +57,7 @@ class ProvenanceStore:
                 CREATE TABLE IF NOT EXISTS sources(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
                     source_type TEXT NOT NULL, reference TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','retracted')),
                     created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
                     UNIQUE(name,reference)
                 );
@@ -91,6 +92,8 @@ class ProvenanceStore:
                     claimed_by TEXT NOT NULL, desired_outcome TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'submitted'
                         CHECK(status IN ('submitted','under_review','negotiating','resolved_return','rejected')),
+                    impact_status TEXT NOT NULL DEFAULT 'normal'
+                        CHECK(impact_status IN ('normal','invalid')),
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS claim_reviews(
@@ -112,8 +115,50 @@ class ProvenanceStore:
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS source_retractions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL REFERENCES sources(id),
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','pending_retry','confirmed')),
+                    impact_scope TEXT NOT NULL DEFAULT '{}',
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    confirmed_by TEXT REFERENCES users(id),
+                    confirmed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS retraction_items(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    retraction_id INTEGER NOT NULL REFERENCES source_retractions(id),
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','done','failed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(retraction_id, object_id)
+                );
+                CREATE TABLE IF NOT EXISTS source_updates(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL REFERENCES sources(id),
+                    changes TEXT NOT NULL,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_source_retractions_active
+                    ON source_retractions(source_id)
+                    WHERE status IN ('pending','pending_retry');
                 """
             )
+            for ddl in (
+                "ALTER TABLE sources ADD COLUMN status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','retracted'))",
+                "ALTER TABLE claims ADD COLUMN impact_status TEXT NOT NULL DEFAULT 'normal' CHECK(impact_status IN ('normal','invalid'))",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc):
+                        raise
 
     def seed(self):
         self.init_schema()
@@ -124,6 +169,7 @@ class ProvenanceStore:
                     ("staff", "藏品研究员", "staff"),
                     ("reviewer1", "返还审查员", "reviewer"),
                     ("claimant1", "权利主张人", "claimant"),
+                    ("claimant2", "第二主张人", "claimant"),
                     ("public", "公众访客", "public"),
                 ],
             )
@@ -212,6 +258,264 @@ class ProvenanceStore:
             except sqlite3.IntegrityError:
                 raise BusinessError("来源记录已存在", 409, "source_exists")
             return {"id": cur.lastrowid, "name": name.strip(), "reference": reference.strip()}
+
+    def _compute_impact(self, conn, source_id):
+        """列出引用该来源的藏品、流转事件，以及依赖这些藏品的权利主张。"""
+        events = conn.execute(
+            "SELECT id,object_id FROM events WHERE source_id=? ORDER BY id", (source_id,)
+        ).fetchall()
+        event_ids = [e["id"] for e in events]
+        object_ids = sorted({e["object_id"] for e in events})
+        claim_ids = []
+        if object_ids:
+            placeholders = ",".join("?" * len(object_ids))
+            claim_ids = [c["id"] for c in conn.execute(
+                f"SELECT id FROM claims WHERE object_id IN ({placeholders}) ORDER BY id", object_ids
+            ).fetchall()]
+        return {"object_ids": object_ids, "event_ids": event_ids, "claim_ids": claim_ids}
+
+    def _absorb_new_impact(self, conn, retraction, impact):
+        """把新进入影响范围的藏品补入撤回明细，返回范围是否有变化。"""
+        stored = json.loads(retraction["impact_scope"])
+        if stored == impact:
+            return False
+        conn.execute(
+            "UPDATE source_retractions SET impact_scope=? WHERE id=?",
+            (json.dumps(impact, ensure_ascii=False, sort_keys=True), retraction["id"]),
+        )
+        existing = {r["object_id"] for r in conn.execute(
+            "SELECT object_id FROM retraction_items WHERE retraction_id=?", (retraction["id"],)
+        ).fetchall()}
+        for oid in impact["object_ids"]:
+            if oid not in existing:
+                conn.execute(
+                    "INSERT INTO retraction_items(retraction_id,object_id,status,attempts,updated_at) VALUES(?,?,?,?,?)",
+                    (retraction["id"], oid, "pending", 0, now()),
+                )
+        return True
+
+    def _claimant_impact(self, conn, impact, user_id):
+        """主张人只能看到与自己主张有关的影响。"""
+        rows = conn.execute(
+            "SELECT id,object_id FROM claims WHERE claimant_id=?", (user_id,)
+        ).fetchall()
+        own = {r["id"]: r["object_id"] for r in rows}
+        claim_ids = [cid for cid in impact["claim_ids"] if cid in own]
+        object_ids = sorted({own[cid] for cid in claim_ids})
+        event_ids = []
+        if impact["event_ids"] and object_ids:
+            ph_e = ",".join("?" * len(impact["event_ids"]))
+            ph_o = ",".join("?" * len(object_ids))
+            event_ids = [e["id"] for e in conn.execute(
+                f"SELECT id FROM events WHERE id IN ({ph_e}) AND object_id IN ({ph_o})",
+                [*impact["event_ids"], *object_ids],
+            ).fetchall()]
+        return {"object_ids": object_ids, "event_ids": event_ids, "claim_ids": claim_ids}
+
+    def create_retraction(self, user_id, source_id, reason):
+        """工作人员选定来源、填写原因，发起撤回并先拿到影响范围。"""
+        reason = reason.strip()
+        if not reason:
+            raise BusinessError("撤回原因不能为空", 422, "invalid_reason")
+        with self._lock:
+            with self.connect() as conn:
+                self._user(conn, user_id, {"staff"})
+                source = conn.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+                if not source:
+                    raise BusinessError("来源不存在", 404, "source_not_found")
+                if source["status"] == "retracted":
+                    raise BusinessError("来源已撤回，不能重复发起", 409, "source_already_retracted")
+                impact = self._compute_impact(conn, source_id)
+                existing = conn.execute(
+                    "SELECT * FROM source_retractions WHERE source_id=? AND status IN ('pending','pending_retry') ORDER BY id DESC LIMIT 1",
+                    (source_id,),
+                ).fetchone()
+                if existing:
+                    # 先到者生效：后到的提交不新建撤回，直接拿到最新影响范围。
+                    self._absorb_new_impact(conn, existing, impact)
+                    return {"retraction_id": existing["id"], "created": False, "status": existing["status"],
+                            "impact": impact, "reason": existing["reason"]}
+                try:
+                    cur = conn.execute(
+                        """INSERT INTO source_retractions(source_id,reason,status,impact_scope,created_by,created_at)
+                           VALUES(?,?,?,?,?,?)""",
+                        (source_id, reason, "pending", json.dumps(impact, ensure_ascii=False, sort_keys=True), user_id, now()),
+                    )
+                except sqlite3.IntegrityError:
+                    existing = conn.execute(
+                        "SELECT * FROM source_retractions WHERE source_id=? AND status IN ('pending','pending_retry') ORDER BY id DESC LIMIT 1",
+                        (source_id,),
+                    ).fetchone()
+                    if existing:
+                        self._absorb_new_impact(conn, existing, impact)
+                        return {"retraction_id": existing["id"], "created": False, "status": existing["status"],
+                                "impact": impact, "reason": existing["reason"]}
+                    raise BusinessError("来源已撤回", 409, "source_already_retracted")
+                rid = cur.lastrowid
+                for oid in impact["object_ids"]:
+                    conn.execute(
+                        "INSERT INTO retraction_items(retraction_id,object_id,status,attempts,updated_at) VALUES(?,?,?,?,?)",
+                        (rid, oid, "pending", 0, now()),
+                    )
+                for oid in impact["object_ids"]:
+                    self._audit(conn, oid, user_id, "retraction.create",
+                                {"retraction_id": rid, "source_id": source_id, "reason": reason})
+                return {"retraction_id": rid, "created": True, "status": "pending",
+                        "impact": impact, "reason": reason}
+
+    def _process_retraction_item(self, conn, retraction_id, item_id, object_id, source_id, reason, actor_id):
+        row = conn.execute("SELECT status FROM retraction_items WHERE id=?", (item_id,)).fetchone()
+        if not row or row["status"] == "done":
+            return  # 重复提交不写第二遍审计。
+        obj = self._object(conn, object_id)
+        next_version = obj["version"] + 1
+        conn.execute("UPDATE objects SET version=?, updated_at=? WHERE id=?", (next_version, now(), object_id))
+        self._snapshot(conn, object_id, actor_id)
+        self._audit(conn, object_id, actor_id, "retraction.confirm",
+                    {"retraction_id": retraction_id, "source_id": source_id,
+                     "reason": reason, "version": next_version})
+        conn.execute(
+            "UPDATE retraction_items SET status='done', attempts=attempts+1, last_error=NULL, updated_at=? WHERE id=?",
+            (now(), item_id),
+        )
+
+    def confirm_retraction(self, user_id, retraction_id, fail_after=None):
+        """确认撤回：批量写入影响对象，失败保留进度，重试只续做未完成对象。"""
+        with self._lock:
+            with self.connect() as conn:
+                self._user(conn, user_id, {"staff"})
+                r = conn.execute("SELECT * FROM source_retractions WHERE id=?", (retraction_id,)).fetchone()
+                if not r:
+                    raise BusinessError("撤回请求不存在", 404, "retraction_not_found")
+                source = conn.execute("SELECT * FROM sources WHERE id=?", (r["source_id"],)).fetchone()
+                if r["status"] == "confirmed" or source["status"] == "retracted":
+                    # 先到者已生效：后到者拿到最新影响范围，不重复写审计。
+                    impact = self._compute_impact(conn, r["source_id"])
+                    return {"retraction_id": retraction_id, "status": "confirmed",
+                            "already_confirmed": True, "impact": impact, "processed": 0}
+                impact = self._compute_impact(conn, r["source_id"])
+                stored = json.loads(r["impact_scope"])
+                new_object_ids = sorted(set(impact["object_ids"]) - set(stored["object_ids"]))
+                self._absorb_new_impact(conn, r, impact)
+                if new_object_ids:
+                    # 确认前新增引用：停在待重试，把新对象纳入影响范围。
+                    conn.execute("UPDATE source_retractions SET status='pending_retry' WHERE id=?", (retraction_id,))
+                    return {"retraction_id": retraction_id, "status": "pending_retry",
+                            "new_object_ids": new_object_ids, "impact": impact}
+                item_rows = conn.execute(
+                    "SELECT id,object_id FROM retraction_items WHERE retraction_id=? AND status!='done' ORDER BY object_id",
+                    (retraction_id,),
+                ).fetchall()
+            processed = 0
+            for item in item_rows:
+                if fail_after is not None and processed >= fail_after:
+                    raise BusinessError("批量写入失败，进度已保留，可重试续做", 500, "batch_failed")
+                with self.connect() as conn:
+                    self._process_retraction_item(
+                        conn, retraction_id, item["id"], item["object_id"],
+                        r["source_id"], r["reason"], user_id,
+                    )
+                processed += 1
+            with self.connect() as conn:
+                conn.execute("UPDATE sources SET status='retracted' WHERE id=?", (r["source_id"],))
+                conn.execute(
+                    "UPDATE source_retractions SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=?",
+                    (user_id, now(), retraction_id),
+                )
+            return {"retraction_id": retraction_id, "status": "confirmed",
+                    "already_confirmed": False, "impact": impact, "processed": processed}
+
+    def get_retraction(self, user_id, retraction_id):
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            r = conn.execute("SELECT * FROM source_retractions WHERE id=?", (retraction_id,)).fetchone()
+            if not r:
+                raise BusinessError("撤回请求不存在", 404, "retraction_not_found")
+            if user["role"] == "public":
+                raise BusinessError("公众无权查看撤回详情", 403, "forbidden")
+            impact = json.loads(r["impact_scope"])
+            items = [dict(i) for i in conn.execute(
+                "SELECT id,object_id,status,attempts,updated_at FROM retraction_items WHERE retraction_id=? ORDER BY object_id",
+                (retraction_id,),
+            ).fetchall()]
+            if user["role"] == "claimant":
+                impact = self._claimant_impact(conn, impact, user_id)
+                items = [i for i in items if i["object_id"] in set(impact["object_ids"])]
+            return {
+                "id": r["id"], "source_id": r["source_id"], "reason": r["reason"],
+                "status": r["status"], "created_at": r["created_at"],
+                "confirmed_at": r["confirmed_at"], "impact": impact, "items": items,
+            }
+
+    def list_retractions(self, user_id):
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            if user["role"] == "public":
+                raise BusinessError("公众无权查看撤回列表", 403, "forbidden")
+            rows = conn.execute("SELECT * FROM source_retractions ORDER BY id DESC").fetchall()
+            out = []
+            for r in rows:
+                impact = json.loads(r["impact_scope"])
+                if user["role"] == "claimant":
+                    impact = self._claimant_impact(conn, impact, user_id)
+                    if not impact["claim_ids"]:
+                        continue  # 不影响该主张人的撤回不列出。
+                out.append({
+                    "id": r["id"], "source_id": r["source_id"], "reason": r["reason"],
+                    "status": r["status"], "created_at": r["created_at"],
+                    "confirmed_at": r["confirmed_at"], "impact": impact,
+                })
+            return out
+
+    def update_source(self, user_id, source_id, changes):
+        """来源更正：依赖它的未完成主张失效并重算，已完成返还和快照保留。"""
+        allowed = {"name", "source_type", "reference"}
+        clean = {k: str(v).strip() for k, v in changes.items() if k in allowed and str(v).strip()}
+        if not clean:
+            raise BusinessError("没有可更新字段", 422, "empty_update")
+        with self._lock:
+            with self.connect() as conn:
+                self._user(conn, user_id, {"staff"})
+                source = conn.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+                if not source:
+                    raise BusinessError("来源不存在", 404, "source_not_found")
+                assignments = ",".join(f"{k}=?" for k in clean)
+                conn.execute(f"UPDATE sources SET {assignments} WHERE id=?", (*clean.values(), source_id))
+                conn.execute(
+                    "INSERT INTO source_updates(source_id,changes,created_by,created_at) VALUES(?,?,?,?)",
+                    (source_id, json.dumps(clean, ensure_ascii=False, sort_keys=True), user_id, now()),
+                )
+                impact = self._compute_impact(conn, source_id)
+                invalidated = []
+                affected_objects = set()
+                if impact["claim_ids"]:
+                    ph = ",".join("?" * len(impact["claim_ids"]))
+                    unfinished = conn.execute(
+                        f"SELECT id,object_id,status FROM claims WHERE id IN ({ph}) "
+                        "AND status IN ('submitted','under_review','negotiating')",
+                        impact["claim_ids"],
+                    ).fetchall()
+                    for c in unfinished:
+                        conn.execute("UPDATE claims SET impact_status='invalid', updated_at=? WHERE id=?",
+                                     (now(), c["id"]))
+                        invalidated.append({"claim_id": c["id"], "object_id": c["object_id"], "old_status": c["status"]})
+                        affected_objects.add(c["object_id"])
+                for oid in sorted(affected_objects):
+                    obj = self._object(conn, oid)
+                    next_version = obj["version"] + 1
+                    conn.execute("UPDATE objects SET version=?, updated_at=? WHERE id=?", (next_version, now(), oid))
+                    self._snapshot(conn, oid, user_id)
+                    conn.execute(
+                        "INSERT INTO audit_log(object_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
+                        (oid, user_id, "source.update", json.dumps({
+                            "source_id": source_id, "changes": clean,
+                            "invalidated_claim_ids": [c["claim_id"] for c in invalidated if c["object_id"] == oid],
+                            "version": next_version,
+                        }, ensure_ascii=False, sort_keys=True), now()),
+                    )
+                return {"source_id": source_id, "changes": clean,
+                        "invalidated_claims": invalidated,
+                        "affected_objects": sorted(affected_objects)}
 
     def add_event(self, user_id, object_id, event_type, date_start, date_end, place, description, source_id=None, visibility="internal"):
         if not event_type.strip() or not description.strip() or not place.strip():
@@ -317,7 +621,7 @@ class ProvenanceStore:
                     (object_id,),
                 ).fetchall()
                 claims = conn.execute(
-                    "SELECT id,claimed_by,desired_outcome,status,created_at FROM claims WHERE object_id=? ORDER BY id", (object_id,)
+                    "SELECT id,claimed_by,desired_outcome,status,impact_status,created_at FROM claims WHERE object_id=? ORDER BY id", (object_id,)
                 ).fetchall()
                 return {
                     "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
@@ -328,7 +632,7 @@ class ProvenanceStore:
                 "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                 "object_type": obj["object_type"], "current_holder": obj["current_holder"],
                 "public_summary": obj["public_summary"], "version": obj["version"],
-                "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
+                "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference,status FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
                                      "evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
                             for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
@@ -412,6 +716,17 @@ class Handler(BaseHTTPRequestHandler):
             d = self._body(); return self._send(201, store.create_object(user, d.get("inventory_no", ""), d.get("title", ""), d.get("object_type", ""), d.get("current_holder", ""), d.get("public_summary", "")))
         if parts == ["api", "sources"] and method == "POST":
             d = self._body(); return self._send(201, store.add_source(user, d.get("name", ""), d.get("source_type", ""), d.get("reference", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "sources"] and parts[3] == "retractions" and method == "POST":
+            d = self._body(); result = store.create_retraction(user, int(parts[2]), d.get("reason", ""))
+            return self._send(201 if result.get("created") else 200, result)
+        if len(parts) == 4 and parts[:2] == ["api", "sources"] and parts[3] == "update" and method == "POST":
+            d = self._body(); return self._send(200, store.update_source(user, int(parts[2]), d.get("changes", {})))
+        if parts == ["api", "retractions"] and method == "GET":
+            return self._send(200, {"items": store.list_retractions(user)})
+        if len(parts) == 3 and parts[:2] == ["api", "retractions"] and method == "GET":
+            return self._send(200, store.get_retraction(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "retractions"] and parts[3] == "confirm" and method == "POST":
+            d = self._body(); return self._send(200, store.confirm_retraction(user, int(parts[2]), d.get("fail_after")))
         if len(parts) >= 3 and parts[:2] == ["api", "objects"]:
             object_id = int(parts[2])
             if len(parts) == 3 and method == "GET": return self._send(200, store.get_object(user, object_id))

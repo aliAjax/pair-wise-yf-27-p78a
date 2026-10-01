@@ -1,4 +1,17 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>body{font:16px system-ui;max-width:1080px;margin:32px auto;padding:0 16px}select,button,input{padding:8px;margin:4px;font:inherit}input{width:260px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}h2{margin:0 0 8px;font-size:18px}</style></head>
+<body><h1>藏品来源与返还审查</h1>
+<div class="panel"><div class="row"><label>演示身份</label><select id="user"><option value="staff">staff（工作人员）</option><option value="reviewer1">reviewer1（审查员）</option><option value="claimant1">claimant1（主张人）</option><option value="claimant2">claimant2（第二主张人）</option><option value="public">public（公众）</option></select><button onclick="loadObjects()">查看藏品</button><button onclick="loadRetractions()">查看撤回列表</button></div></div>
+<div class="panel"><h2>来源撤回与影响核对</h2><div class="row"><label>来源 ID</label><input id="retract-source" placeholder="source id"><label>撤回原因</label><input id="retract-reason" placeholder="填写撤回原因"><button onclick="createRetraction()">发起撤回并列出影响</button></div><div class="row"><label>撤回请求 ID</label><input id="retract-id" placeholder="retraction id"><label>批量失败数(测试)</label><input id="retract-fail" placeholder="留空=不失败" style="width:120px"><button onclick="confirmRetraction()">确认撤回 / 重试</button></div><pre id="retract-out"></pre></div>
+<div class="panel"><h2>来源更正</h2><div class="row"><label>来源 ID</label><input id="update-source" placeholder="source id"><label>新引用号</label><input id="update-ref" placeholder="新 reference"><button onclick="updateSource()">更正来源</button></div><pre id="update-out"></pre></div>
+<div class="panel"><h2>输出</h2><pre id="out"></pre></div>
+<script>
+const H=()=>({"X-User-Id":user.value,"Content-Type":"application/json"});
+async function api(method,url,body){const opt={method,headers:H()};if(body!==undefined)opt.body=JSON.stringify(body);const r=await fetch(url,opt);const data=await r.json().catch(()=>({}));return{status:r.status,data};}
+function show(el,data){document.getElementById(el).textContent=JSON.stringify(data,null,2)}
+async function loadObjects(){const{data}=await api("GET","/api/objects");show("out",data)}
+async function loadRetractions(){const{data}=await api("GET","/api/retractions");show("out",data)}
+async function createRetraction(){const sourceId=document.getElementById("retract-source").value.trim();const reason=document.getElementById("retract-reason").value.trim();const{data}=await api("POST",`/api/sources/${sourceId}/retractions`,{reason});show("retract-out",data);if(data.retraction_id)document.getElementById("retract-id").value=data.retraction_id;}
+async function confirmRetraction(){const id=document.getElementById("retract-id").value.trim();const fail=document.getElementById("retract-fail").value.trim();const body={};if(fail!=="")body.fail_after=Number(fail);const{data}=await api("POST",`/api/retractions/${id}/confirm`,body);show("retract-out",data);}
+async function updateSource(){const sourceId=document.getElementById("update-source").value.trim();const ref=document.getElementById("update-ref").value.trim();const{data}=await api("POST",`/api/sources/${sourceId}/update`,{changes:{reference:ref}});show("update-out",data);}
+</script></body></html>
