@@ -21,13 +21,17 @@ CLAIM_TRANSITIONS = {
     "negotiating": {"resolved_return", "rejected"},
     "resolved_return": set(),
     "rejected": set(),
+    # 来源撤回/更正后失效的主张，可由审查员退回 submitted 重算。
+    "invalidated": {"submitted"},
 }
+SOURCE_UPDATE_KINDS = {"withdrawal", "correction"}
+UNFINISHED_CLAIM_STATUS = ("submitted", "under_review", "negotiating")
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", details=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.details = message, status, code, details
 
 
 def now():
@@ -57,6 +61,8 @@ class ProvenanceStore:
                 CREATE TABLE IF NOT EXISTS sources(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
                     source_type TEXT NOT NULL, reference TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','withdrawn','corrected')),
                     created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
                     UNIQUE(name,reference)
                 );
@@ -90,7 +96,7 @@ class ProvenanceStore:
                     claimant_id TEXT NOT NULL REFERENCES users(id),
                     claimed_by TEXT NOT NULL, desired_outcome TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'submitted'
-                        CHECK(status IN ('submitted','under_review','negotiating','resolved_return','rejected')),
+                        CHECK(status IN ('submitted','under_review','negotiating','resolved_return','rejected','invalidated')),
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS claim_reviews(
@@ -111,6 +117,26 @@ class ProvenanceStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, object_id INTEGER REFERENCES objects(id),
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS source_updates(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL REFERENCES sources(id),
+                    kind TEXT NOT NULL CHECK(kind IN ('withdrawal','correction')),
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending_confirmation'
+                        CHECK(status IN ('pending_confirmation','pending_retry','applying','applied')),
+                    scope TEXT NOT NULL, scope_token TEXT NOT NULL,
+                    correction TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL, applied_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS source_update_items(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    update_id INTEGER NOT NULL REFERENCES source_updates(id),
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','done')),
+                    processed_at TEXT,
+                    UNIQUE(update_id,object_id)
                 );
                 """
             )
@@ -142,6 +168,12 @@ class ProvenanceStore:
         row = conn.execute("SELECT * FROM objects WHERE id=?", (object_id,)).fetchone()
         if not row:
             raise BusinessError("藏品不存在", 404, "not_found")
+        return row
+
+    def _source(self, conn, source_id):
+        row = conn.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+        if not row:
+            raise BusinessError("来源不存在", 404, "source_not_found")
         return row
 
     def _audit(self, conn, object_id, actor, action, detail):
@@ -307,6 +339,284 @@ class ProvenanceStore:
                 conn.rollback()
                 raise
 
+    # ---- 来源撤回/更正的影响核对 ----
+
+    def _impact_scope(self, conn, source_id):
+        """引用该来源的藏品、流转事件和权利主张。"""
+        events = [dict(e) for e in conn.execute(
+            "SELECT id,object_id,event_type,visibility,created_at FROM events WHERE source_id=? ORDER BY id",
+            (source_id,)).fetchall()]
+        object_ids = sorted({e["object_id"] for e in events})
+        objects, claims = [], []
+        if object_ids:
+            marks = ",".join("?" * len(object_ids))
+            objects = [dict(o) for o in conn.execute(
+                f"SELECT id,inventory_no,title,version FROM objects WHERE id IN ({marks}) ORDER BY id",
+                object_ids).fetchall()]
+            claims = [dict(c) for c in conn.execute(
+                f"SELECT id,object_id,claimant_id,claimed_by,status,created_at FROM claims WHERE object_id IN ({marks}) ORDER BY id",
+                object_ids).fetchall()]
+        return {"objects": objects, "events": events, "claims": claims}
+
+    @staticmethod
+    def _scope_token(scope):
+        key = {k: [x["id"] for x in scope[k]] for k in ("objects", "events", "claims")}
+        return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+
+    @staticmethod
+    def _new_entries(old, new):
+        seen = {x["id"] for x in old}
+        return [x for x in new if x["id"] not in seen]
+
+    def _update_row(self, conn, update_id):
+        row = conn.execute("SELECT * FROM source_updates WHERE id=?", (update_id,)).fetchone()
+        if not row:
+            raise BusinessError("来源更新请求不存在", 404, "not_found")
+        return row
+
+    def _update_progress(self, conn, update_id):
+        items = [dict(r) for r in conn.execute(
+            "SELECT object_id,status,processed_at FROM source_update_items WHERE update_id=? ORDER BY object_id",
+            (update_id,)).fetchall()]
+        done = sum(1 for i in items if i["status"] == "done")
+        return {"total": len(items), "done": done, "pending": len(items) - done, "items": items}
+
+    def create_source_update(self, user_id, source_id, kind="withdrawal", reason="", correction=None):
+        kind = (kind or "withdrawal").strip()
+        if kind not in SOURCE_UPDATE_KINDS:
+            raise BusinessError("kind 必须是 withdrawal 或 correction", 422, "invalid_kind")
+        if not str(reason).strip():
+            raise BusinessError("必须填写撤回或更正原因", 422, "reason_required")
+        correction = correction or {}
+        if kind == "correction":
+            correction = {k: str(v).strip() for k, v in correction.items()
+                          if k in {"name", "reference"} and str(v).strip()}
+            if not correction:
+                raise BusinessError("更正必须提供新的名称或引用", 422, "invalid_correction")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            source = self._source(conn, source_id)
+            if source["status"] == "withdrawn":
+                raise BusinessError("来源已撤回，不能再次发起", 409, "source_withdrawn")
+            scope = self._impact_scope(conn, source_id)
+            token = self._scope_token(scope)
+            cur = conn.execute(
+                """INSERT INTO source_updates(source_id,kind,reason,status,scope,scope_token,correction,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (source_id, kind, str(reason).strip(), "pending_confirmation",
+                 json.dumps(scope, ensure_ascii=False, sort_keys=True), token,
+                 json.dumps(correction, ensure_ascii=False, sort_keys=True) if correction else None,
+                 user_id, now()))
+            self._audit(conn, None, user_id, "source_update.create",
+                        {"update_id": cur.lastrowid, "source_id": source_id, "kind": kind})
+            return {"id": cur.lastrowid, "source_id": source_id, "kind": kind,
+                    "status": "pending_confirmation", "impact": scope, "scope_token": token}
+
+    def confirm_source_update(self, user_id, update_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            conn.execute("BEGIN IMMEDIATE")
+            upd = self._update_row(conn, update_id)
+            if upd["status"] == "applied":
+                raise BusinessError("该请求已生效，重复提交不会再次写入", 409, "update_already_applied",
+                                    {"impact": self._impact_scope(conn, upd["source_id"])})
+            if upd["status"] == "applying":
+                raise BusinessError("批量写入中断，请使用重试接口续做", 409, "update_in_progress",
+                                    {"progress": self._update_progress(conn, update_id)})
+            blocker = conn.execute(
+                """SELECT id FROM source_updates
+                   WHERE source_id=? AND id<>? AND status IN ('applying','applied')
+                   ORDER BY id DESC LIMIT 1""", (upd["source_id"], update_id)).fetchone()
+            if blocker:
+                # 先到者已生效，后到者拿到最新影响范围重新核对。
+                raise BusinessError("该来源已有在先的撤回或更正生效，请基于最新影响范围重新核对", 409,
+                                    "source_update_conflict",
+                                    {"blocking_update_id": blocker["id"],
+                                     "impact": self._impact_scope(conn, upd["source_id"])})
+            scope = self._impact_scope(conn, upd["source_id"])
+            token = self._scope_token(scope)
+            if token != upd["scope_token"]:
+                old = json.loads(upd["scope"])
+                conn.execute("UPDATE source_updates SET status='pending_retry',scope=?,scope_token=? WHERE id=?",
+                             (json.dumps(scope, ensure_ascii=False, sort_keys=True), token, update_id))
+                conn.commit()
+                raise BusinessError("确认前出现新增引用，请求已停在待重试", 409, "scope_changed",
+                                    {"status": "pending_retry", "impact": scope,
+                                     "new_objects": self._new_entries(old["objects"], scope["objects"]),
+                                     "new_events": self._new_entries(old["events"], scope["events"]),
+                                     "new_claims": self._new_entries(old["claims"], scope["claims"])})
+            conn.execute("UPDATE source_updates SET status='applying' WHERE id=?", (update_id,))
+            for obj in scope["objects"]:
+                conn.execute("INSERT OR IGNORE INTO source_update_items(update_id,object_id) VALUES(?,?)",
+                             (update_id, obj["id"]))
+            conn.commit()
+        self._run_update_items(update_id, user_id)
+        return self._finish_update(user_id, update_id)
+
+    def refresh_source_update(self, user_id, update_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            conn.execute("BEGIN IMMEDIATE")
+            upd = self._update_row(conn, update_id)
+            if upd["status"] not in ("pending_confirmation", "pending_retry"):
+                raise BusinessError("当前状态不能重新核对", 409, "invalid_refresh")
+            scope = self._impact_scope(conn, upd["source_id"])
+            token = self._scope_token(scope)
+            conn.execute(
+                "UPDATE source_updates SET status='pending_confirmation',scope=?,scope_token=? WHERE id=?",
+                (json.dumps(scope, ensure_ascii=False, sort_keys=True), token, update_id))
+            conn.commit()
+            return {"id": update_id, "status": "pending_confirmation", "impact": scope, "scope_token": token}
+
+    def retry_source_update(self, user_id, update_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            conn.execute("BEGIN IMMEDIATE")
+            upd = self._update_row(conn, update_id)
+            if upd["status"] == "applied":
+                raise BusinessError("该请求已生效，无需重试", 409, "update_already_applied",
+                                    {"impact": self._impact_scope(conn, upd["source_id"])})
+            if upd["status"] != "applying":
+                raise BusinessError("只有批量写入中断的请求才能重试", 409, "invalid_retry")
+            conn.commit()
+        self._run_update_items(update_id, user_id)
+        return self._finish_update(user_id, update_id)
+
+    def _apply_item(self, conn, update, object_id, actor):
+        """单个藏品的写入：未完成主张失效重算、版本快照与审计。失败整体回滚本藏品。"""
+        obj = self._object(conn, object_id)
+        claims = conn.execute(
+            f"SELECT * FROM claims WHERE object_id=? AND status IN ({','.join('?' * len(UNFINISHED_CLAIM_STATUS))}) ORDER BY id",
+            (object_id, *UNFINISHED_CLAIM_STATUS)).fetchall()
+        kind_label = "撤回" if update["kind"] == "withdrawal" else "更正"
+        note = f"来源{kind_label}（{update['reason']}），主张失效并重算"
+        invalidated = []
+        for c in claims:
+            conn.execute("UPDATE claims SET status='invalidated',updated_at=? WHERE id=? AND status=?",
+                         (now(), c["id"], c["status"]))
+            conn.execute(
+                "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
+                (c["id"], actor, c["status"], "invalidated", note, now()))
+            invalidated.append(c["id"])
+        new_version = obj["version"] + 1
+        conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
+        self._snapshot(conn, object_id, actor)
+        self._audit(conn, object_id, actor, "source_update.apply",
+                    {"update_id": update["id"], "source_id": update["source_id"],
+                     "invalidated_claims": invalidated, "version": new_version})
+        conn.execute("UPDATE source_update_items SET status='done',processed_at=? WHERE update_id=? AND object_id=?",
+                     (now(), update["id"], object_id))
+
+    def _run_update_items(self, update_id, actor):
+        """逐藏品独立事务写入；失败保留已完成进度，重试只续做未完成对象。"""
+        try:
+            while True:
+                with self.connect() as conn:
+                    item = conn.execute(
+                        "SELECT id,object_id FROM source_update_items WHERE update_id=? AND status='pending' ORDER BY object_id LIMIT 1",
+                        (update_id,)).fetchone()
+                    if not item:
+                        return
+                    update = dict(self._update_row(conn, update_id))
+                with self.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    still = conn.execute("SELECT status FROM source_update_items WHERE id=?", (item["id"],)).fetchone()
+                    if still["status"] == "pending":
+                        self._apply_item(conn, update, item["object_id"], actor)
+                    conn.commit()
+        except BusinessError:
+            raise
+        except Exception as exc:
+            with self.connect() as conn:
+                progress = self._update_progress(conn, update_id)
+            raise BusinessError(f"批量写入失败，进度已保留，可重试续做：{exc}", 500, "apply_failed",
+                                {"update_id": update_id, "progress": progress})
+
+    def _finish_update(self, user_id, update_id):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            upd = self._update_row(conn, update_id)
+            progress = self._update_progress(conn, update_id)
+            if progress["pending"]:
+                conn.commit()
+                return {"id": update_id, "status": upd["status"], "progress": progress}
+            if upd["status"] != "applied":
+                if upd["kind"] == "withdrawal":
+                    conn.execute("UPDATE sources SET status='withdrawn' WHERE id=?", (upd["source_id"],))
+                else:
+                    correction = json.loads(upd["correction"] or "{}")
+                    if correction:
+                        assignments = ",".join(f"{k}=?" for k in correction)
+                        try:
+                            conn.execute(f"UPDATE sources SET {assignments},status='corrected' WHERE id=?",
+                                         (*correction.values(), upd["source_id"]))
+                        except sqlite3.IntegrityError:
+                            raise BusinessError("更正后的来源名称和引用与现有记录冲突", 409, "source_exists")
+                    else:
+                        conn.execute("UPDATE sources SET status='corrected' WHERE id=?", (upd["source_id"],))
+                # 生效后重算最新影响范围，供后到者与后续核对使用。
+                scope = self._impact_scope(conn, upd["source_id"])
+                conn.execute("UPDATE source_updates SET status='applied',applied_at=?,scope=?,scope_token=? WHERE id=?",
+                             (now(), json.dumps(scope, ensure_ascii=False, sort_keys=True),
+                              self._scope_token(scope), update_id))
+                self._audit(conn, None, user_id, "source_update.applied",
+                            {"update_id": update_id, "source_id": upd["source_id"], "kind": upd["kind"]})
+            result = {"id": update_id, "status": "applied",
+                      "progress": self._update_progress(conn, update_id),
+                      "impact": self._impact_scope(conn, upd["source_id"])}
+            conn.commit()
+            return result
+
+    def get_source_update(self, user_id, update_id):
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            upd = self._update_row(conn, update_id)
+            if user["role"] == "public":
+                raise BusinessError("当前角色无权执行此操作", 403, "forbidden")
+            base = {"id": upd["id"], "source_id": upd["source_id"], "kind": upd["kind"],
+                    "reason": upd["reason"], "status": upd["status"], "created_by": upd["created_by"],
+                    "created_at": upd["created_at"], "applied_at": upd["applied_at"]}
+            scope = self._impact_scope(conn, upd["source_id"])
+            if user["role"] in ("staff", "reviewer"):
+                base["impact"] = scope
+                base["progress"] = self._update_progress(conn, update_id)
+                base["scope_token"] = upd["scope_token"]
+                return base
+            # 主张人只能看到与自己主张有关的影响。
+            my_claims = [{k: c[k] for k in ("id", "object_id", "claimed_by", "status", "created_at")}
+                         for c in scope["claims"] if c["claimant_id"] == user_id]
+            object_ids = {c["object_id"] for c in my_claims}
+            base["impact"] = {
+                "objects": [o for o in scope["objects"] if o["id"] in object_ids],
+                "events": [e for e in scope["events"] if e["object_id"] in object_ids and e["visibility"] == "public"],
+                "claims": my_claims,
+            }
+            return base
+
+    def list_source_updates(self, user_id, source_id):
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            if user["role"] == "public":
+                raise BusinessError("当前角色无权执行此操作", 403, "forbidden")
+            self._source(conn, source_id)
+            rows = conn.execute("SELECT * FROM source_updates WHERE source_id=? ORDER BY id", (source_id,)).fetchall()
+            items = []
+            for r in rows:
+                if user["role"] == "claimant":
+                    scope = json.loads(r["scope"])
+                    if not any(c["claimant_id"] == user_id for c in scope["claims"]):
+                        continue
+                items.append({"id": r["id"], "source_id": r["source_id"], "kind": r["kind"],
+                              "reason": r["reason"], "status": r["status"], "created_by": r["created_by"],
+                              "created_at": r["created_at"], "applied_at": r["applied_at"]})
+            return items
+
+    def source_impact(self, user_id, source_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            self._source(conn, source_id)
+            return {"source_id": source_id, "impact": self._impact_scope(conn, source_id)}
+
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
             user = self._user(conn, user_id)
@@ -328,7 +638,7 @@ class ProvenanceStore:
                 "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                 "object_type": obj["object_type"], "current_holder": obj["current_holder"],
                 "public_summary": obj["public_summary"], "version": obj["version"],
-                "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
+                "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference,status FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
                                      "evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
                             for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
@@ -412,6 +722,18 @@ class Handler(BaseHTTPRequestHandler):
             d = self._body(); return self._send(201, store.create_object(user, d.get("inventory_no", ""), d.get("title", ""), d.get("object_type", ""), d.get("current_holder", ""), d.get("public_summary", "")))
         if parts == ["api", "sources"] and method == "POST":
             d = self._body(); return self._send(201, store.add_source(user, d.get("name", ""), d.get("source_type", ""), d.get("reference", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "sources"]:
+            source_id = int(parts[2])
+            if parts[3] == "updates" and method == "POST":
+                d = self._body(); return self._send(201, store.create_source_update(user, source_id, d.get("kind", "withdrawal"), d.get("reason", ""), d.get("correction")))
+            if parts[3] == "updates" and method == "GET": return self._send(200, {"items": store.list_source_updates(user, source_id)})
+            if parts[3] == "impact" and method == "GET": return self._send(200, store.source_impact(user, source_id))
+        if len(parts) >= 3 and parts[:2] == ["api", "source-updates"]:
+            update_id = int(parts[2])
+            if len(parts) == 3 and method == "GET": return self._send(200, store.get_source_update(user, update_id))
+            if len(parts) == 4 and parts[3] == "confirm" and method == "POST": return self._send(200, store.confirm_source_update(user, update_id))
+            if len(parts) == 4 and parts[3] == "refresh" and method == "POST": return self._send(200, store.refresh_source_update(user, update_id))
+            if len(parts) == 4 and parts[3] == "retry" and method == "POST": return self._send(200, store.retry_source_update(user, update_id))
         if len(parts) >= 3 and parts[:2] == ["api", "objects"]:
             object_id = int(parts[2])
             if len(parts) == 3 and method == "GET": return self._send(200, store.get_object(user, object_id))
@@ -430,7 +752,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except BusinessError as exc:
+            error = {"code": exc.code, "message": exc.message}
+            if exc.details is not None: error["details"] = exc.details
+            self._send(exc.status, {"error": error})
         except (ValueError, TypeError): self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc: self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
 
